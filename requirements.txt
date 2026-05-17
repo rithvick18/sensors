@@ -1,0 +1,4 @@
+mne
+mne-lsl
+pylsl
+requests
