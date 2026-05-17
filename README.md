@@ -1,4 +1,4 @@
-# Sensor LSL Streamer
+# Sensors - LSL Streamer
 
 Flutter app for viewing phone accelerometer and gyroscope values, with UDP streaming to a Python bridge that republishes the samples as an LSL stream for MNE-Python workflows.
 
@@ -59,5 +59,3 @@ python receiver.py --transport http --url http://PHONE_OR_COMPUTER_IP:8080/strea
 ```
 
 If packets do not arrive, check that both devices are on the same network and that your firewall allows UDP on the selected port or TCP access to the HTTP port. On macOS, allow incoming connections when the system prompts you.
-
-# sensors
