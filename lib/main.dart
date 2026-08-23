@@ -4,8 +4,6 @@ import 'dart:io';
 import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
-import 'package:qr_flutter/qr_flutter.dart';
 import 'package:sensors_plus/sensors_plus.dart';
 
 void main() {
@@ -37,26 +35,9 @@ class SensorStreamerPage extends StatefulWidget {
   State<SensorStreamerPage> createState() => _SensorStreamerPageState();
 }
 
-class DetectedIp {
-  final String ip;
-  final String interfaceName;
-  final String label;
-  final bool isWifi;
-  final bool isCgnat;
-
-  const DetectedIp({
-    required this.ip,
-    required this.interfaceName,
-    required this.label,
-    required this.isWifi,
-    required this.isCgnat,
-  });
-}
-
 class _SensorStreamerPageState extends State<SensorStreamerPage> {
   static const _sensorSamplingPeriod = Duration(milliseconds: 10);
   static const _udpSamplingPeriod = Duration(milliseconds: 10);
-  static const _httpSamplingPeriod = Duration(milliseconds: 10);
   static const _displayRefreshPeriod = Duration(milliseconds: 100);
   static const _historyLength = 80;
 
@@ -66,21 +47,15 @@ class _SensorStreamerPageState extends State<SensorStreamerPage> {
   final TextEditingController _portController = TextEditingController(
     text: '12345',
   );
-  final TextEditingController _httpPortController = TextEditingController(
-    text: '8080',
-  );
 
   RawDatagramSocket? _socket;
-  HttpServer? _httpServer;
   StreamSubscription<AccelerometerEvent>? _accelSub;
   StreamSubscription<GyroscopeEvent>? _gyroSub;
-  StreamSubscription<HttpRequest>? _httpRequestSub;
   Timer? _sendTimer;
   Timer? _displayTimer;
   Timer? _rateTimer;
 
   bool _isStreaming = false;
-  bool _isHttpServing = false;
   double _accelX = 0;
   double _accelY = 0;
   double _accelZ = 0;
@@ -88,18 +63,12 @@ class _SensorStreamerPageState extends State<SensorStreamerPage> {
   double _gyroY = 0;
   double _gyroZ = 0;
   int _samplesSent = 0;
-  int _httpSamplesServed = 0;
-  int _httpClients = 0;
   int _samplesAtLastRateCheck = 0;
   double _sendRateHz = 0;
   DateTime? _streamStartedAt;
   DateTime? _lastPacketAt;
-  DateTime? _lastHttpRequestAt;
   DateTime? _lastSensorAt;
   String? _sensorError;
-  String? _httpUrl;
-  List<DetectedIp> _detectedIps = <DetectedIp>[];
-  String? _selectedIp;
   bool _isRemoteControlConnected = false;
 
   HttpClient? _controlClient;
@@ -145,14 +114,12 @@ class _SensorStreamerPageState extends State<SensorStreamerPage> {
     _controlClient?.close(force: true);
     _commandSocket?.close();
     _stopStreaming(updateUi: false);
-    _stopHttpServer(updateUi: false);
     _displayTimer?.cancel();
     _rateTimer?.cancel();
     _accelSub?.cancel();
     _gyroSub?.cancel();
     _ipController.dispose();
     _portController.dispose();
-    _httpPortController.dispose();
     super.dispose();
   }
 
@@ -336,158 +303,6 @@ class _SensorStreamerPageState extends State<SensorStreamerPage> {
     }
   }
 
-  Future<void> _startHttpServer() async {
-    if (_isHttpServing) return;
-
-    final port = int.tryParse(_httpPortController.text.trim());
-    if (port == null || port < 1 || port > 65535) {
-      _showError('Enter an HTTP port from 1 to 65535.');
-      return;
-    }
-
-    try {
-      final server = await HttpServer.bind(
-        InternetAddress.anyIPv4,
-        port,
-        shared: true,
-      );
-      _httpServer = server;
-      _httpRequestSub = server.listen(
-        _handleHttpRequest,
-        onError: (Object error) => _showError('HTTP server error: $error'),
-      );
-
-      final detected = await _resolveAllIpv4();
-      final chosenIp = detected.isNotEmpty ? detected.first.ip : server.address.address;
-
-      if (!mounted) return;
-      setState(() {
-        _isHttpServing = true;
-        _httpSamplesServed = 0;
-        _httpClients = 0;
-        _lastHttpRequestAt = null;
-        _detectedIps = detected;
-        _selectedIp = chosenIp;
-        _httpUrl = 'http://$chosenIp:$port';
-      });
-    } catch (error) {
-      _showError('Failed to start HTTP server: $error');
-      await _stopHttpServer();
-    }
-  }
-
-  void _selectIp(String ip) {
-    if (!mounted) return;
-    final port = _httpPortController.text.trim();
-    setState(() {
-      _selectedIp = ip;
-      _httpUrl = 'http://$ip:$port';
-    });
-  }
-
-  Future<void> _stopHttpServer({bool updateUi = true}) async {
-    await _httpRequestSub?.cancel();
-    _httpRequestSub = null;
-    await _httpServer?.close(force: true);
-    _httpServer = null;
-
-    void updateState() {
-      _isHttpServing = false;
-      _httpClients = 0;
-      _httpUrl = null;
-      _detectedIps = <DetectedIp>[];
-      _selectedIp = null;
-    }
-
-    if (updateUi && mounted) {
-      setState(updateState);
-    } else {
-      updateState();
-    }
-  }
-
-  Future<void> _handleHttpRequest(HttpRequest request) async {
-    _addCorsHeaders(request.response);
-
-    if (request.method == 'OPTIONS') {
-      request.response.statusCode = HttpStatus.noContent;
-      await request.response.close();
-      return;
-    }
-
-    if (request.method != 'GET') {
-      await _writeJson(request.response, {
-        'error': 'Only GET is supported.',
-      }, statusCode: HttpStatus.methodNotAllowed);
-      return;
-    }
-
-    final path = request.uri.path;
-    if (path == '/' || path == '/health') {
-      await _writeJson(request.response, {
-        'status': 'ok',
-        'sample_hz': 100,
-        'endpoints': ['/sample', '/stream', '/health'],
-        'active_stream_clients': _httpClients,
-        'samples_served': _httpSamplesServed,
-        'last_sensor_at': _lastSensorAt?.toIso8601String(),
-      });
-      return;
-    }
-
-    if (path == '/sample' || path == '/latest') {
-      final packet = _nextHttpPacket();
-      await _writeJson(request.response, packet);
-      return;
-    }
-
-    if (path == '/stream') {
-      await _streamHttpSamples(request.response);
-      return;
-    }
-
-    await _writeJson(request.response, {
-      'error': 'Unknown endpoint.',
-    }, statusCode: HttpStatus.notFound);
-  }
-
-  Future<void> _streamHttpSamples(HttpResponse response) async {
-    response.statusCode = HttpStatus.ok;
-    response.headers.contentType = ContentType(
-      'application',
-      'x-ndjson',
-      charset: 'utf-8',
-    );
-    response.bufferOutput = false;
-
-    if (mounted) {
-      setState(() {
-        _httpClients += 1;
-        _lastHttpRequestAt = DateTime.now();
-      });
-    }
-
-    final stream = Stream<List<int>>.periodic(_httpSamplingPeriod, (_) {
-      return utf8.encode('${jsonEncode(_nextHttpPacket())}\n');
-    });
-
-    try {
-      await response.addStream(stream);
-    } catch (_) {
-      // Ignored, client disconnected
-    } finally {
-      if (mounted) {
-        setState(() => _httpClients = math.max(0, _httpClients - 1));
-      }
-    }
-  }
-
-  Map<String, Object?> _nextHttpPacket() {
-    _httpSamplesServed += 1;
-    _lastHttpRequestAt = DateTime.now();
-    return _buildSensorPacket(sequence: _httpSamplesServed);
-  }
-
   Map<String, Object?> _buildSensorPacket({required int sequence}) {
     return {
       'timestamp':
@@ -497,104 +312,6 @@ class _SensorStreamerPageState extends State<SensorStreamerPage> {
       'accel': {'x': _accelX, 'y': _accelY, 'z': _accelZ},
       'gyro': {'x': _gyroX, 'y': _gyroY, 'z': _gyroZ},
     };
-  }
-
-  Future<void> _writeJson(
-    HttpResponse response,
-    Map<String, Object?> payload, {
-    int statusCode = HttpStatus.ok,
-  }) async {
-    response.statusCode = statusCode;
-    response.headers.contentType = ContentType.json;
-    response.write(jsonEncode(payload));
-    await response.close();
-  }
-
-  void _addCorsHeaders(HttpResponse response) {
-    response.headers
-      ..set(HttpHeaders.accessControlAllowOriginHeader, '*')
-      ..set(HttpHeaders.accessControlAllowMethodsHeader, 'GET, OPTIONS')
-      ..set(HttpHeaders.accessControlAllowHeadersHeader, 'Content-Type')
-      ..set(HttpHeaders.cacheControlHeader, 'no-store');
-  }
-
-  Future<List<DetectedIp>> _resolveAllIpv4() async {
-    final list = <DetectedIp>[];
-    try {
-      final interfaces = await NetworkInterface.list(
-        includeLinkLocal: false,
-        type: InternetAddressType.IPv4,
-      );
-      for (final iface in interfaces) {
-        final name = iface.name.toLowerCase();
-        for (final address in iface.addresses) {
-          if (address.isLoopback) continue;
-          final ip = address.address;
-          final isWifi = name.startsWith('en0') ||
-              name.startsWith('wlan') ||
-              name.contains('wifi') ||
-              name == 'en';
-          final isCgnat = _isCarrierCgnat(ip);
-          String label;
-          if (isWifi) {
-            label = 'Wi-Fi ($name)';
-          } else if (name.startsWith('pdp_ip')) {
-            label = 'Cellular ($name)';
-          } else if (name.startsWith('utun') || name.contains('tun')) {
-            label = 'VPN ($name)';
-          } else {
-            label = iface.name;
-          }
-          list.add(
-            DetectedIp(
-              ip: ip,
-              interfaceName: iface.name,
-              label: label,
-              isWifi: isWifi,
-              isCgnat: isCgnat,
-            ),
-          );
-        }
-      }
-    } catch (_) {}
-
-    list.sort((a, b) {
-      int score(DetectedIp item) {
-        final isPriv = _isPrivateLan(item.ip);
-        if (item.isWifi && isPriv && !item.isCgnat) return 100;
-        if (item.isWifi && !item.isCgnat) return 80;
-        if (isPriv && !item.isCgnat) return 60;
-        if (item.label.contains('VPN')) return 40;
-        if (item.isCgnat || item.label.contains('Cellular')) return 10;
-        return 20;
-      }
-
-      return score(b).compareTo(score(a));
-    });
-
-    return list;
-  }
-
-  bool _isCarrierCgnat(String ip) {
-    final parts = ip.split('.').map(int.tryParse).toList();
-    if (parts.length == 4 &&
-        parts[0] == 100 &&
-        parts[1] != null &&
-        parts[1]! >= 64 &&
-        parts[1]! <= 127) {
-      return true;
-    }
-    return false;
-  }
-
-  bool _isPrivateLan(String ip) {
-    final parts = ip.split('.').map(int.tryParse).toList();
-    if (parts.length != 4 || parts.any((p) => p == null)) return false;
-    final a = parts[0]!, b = parts[1]!;
-    if (a == 192 && b == 168) return true;
-    if (a == 10 && !_isCarrierCgnat(ip)) return true;
-    if (a == 172 && b >= 16 && b <= 31) return true;
-    return false;
   }
 
   void _stopStreaming({bool updateUi = true}) {
@@ -638,6 +355,13 @@ class _SensorStreamerPageState extends State<SensorStreamerPage> {
     }
   }
 
+  void _showInstructionsDialog(BuildContext context) {
+    showDialog(
+      context: context,
+      builder: (context) => const _InstructionsDialog(),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final colorScheme = Theme.of(context).colorScheme;
@@ -645,17 +369,30 @@ class _SensorStreamerPageState extends State<SensorStreamerPage> {
     return Scaffold(
       appBar: AppBar(
         title: const Text('Sensor LSL Streamer'),
+        elevation: 0,
+        scrolledUnderElevation: 0,
+        backgroundColor: Colors.white,
+        surfaceTintColor: Colors.transparent,
         actions: [
+          IconButton(
+            icon: const Icon(Icons.help_outline_rounded),
+            tooltip: 'Instructions',
+            onPressed: () => _showInstructionsDialog(context),
+          ),
           Padding(
-            padding: const EdgeInsets.only(right: 16),
+            padding: const EdgeInsets.only(right: 16, left: 4),
             child: _StatusPill(isStreaming: _isStreaming),
           ),
         ],
       ),
       body: SafeArea(
         child: SingleChildScrollView(
+          physics: const AlwaysScrollableScrollPhysics(
+            parent: BouncingScrollPhysics(),
+          ),
           padding: const EdgeInsets.all(16),
-          child: Center(
+          child: Align(
+            alignment: Alignment.topCenter,
             child: ConstrainedBox(
               constraints: const BoxConstraints(maxWidth: 880),
               child: Column(
@@ -679,21 +416,6 @@ class _SensorStreamerPageState extends State<SensorStreamerPage> {
                     onToggleStreaming: _isStreaming
                         ? _stopStreaming
                         : () => _startStreaming(),
-                  ),
-                  const SizedBox(height: 12),
-                  _HttpServerCard(
-                    portController: _httpPortController,
-                    isServing: _isHttpServing,
-                    url: _httpUrl,
-                    detectedIps: _detectedIps,
-                    selectedIp: _selectedIp,
-                    onSelectIp: _selectIp,
-                    samplesServed: _httpSamplesServed,
-                    activeClients: _httpClients,
-                    lastRequestAt: _lastHttpRequestAt,
-                    onToggleServing: _isHttpServing
-                        ? () => _stopHttpServer()
-                        : () => _startHttpServer(),
                   ),
                   const SizedBox(height: 12),
                   LayoutBuilder(
@@ -874,26 +596,28 @@ class _EndpointCard extends StatelessWidget {
           children: [
             Row(
               children: [
-                Icon(Icons.hub, color: colorScheme.primary),
+                Icon(Icons.hub_outlined, color: colorScheme.primary, size: 22),
                 const SizedBox(width: 8),
-                Text(
-                  'UDP Endpoint / Streaming',
-                  style: theme.textTheme.titleMedium?.copyWith(
-                    fontWeight: FontWeight.w700,
+                Expanded(
+                  child: Text(
+                    'UDP Streaming',
+                    style: theme.textTheme.titleMedium?.copyWith(
+                      fontWeight: FontWeight.w700,
+                    ),
                   ),
                 ),
-                const Spacer(),
+                const SizedBox(width: 8),
                 Container(
                   padding:
-                      const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                      const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
                   decoration: BoxDecoration(
                     color: isRemoteControlConnected
                         ? Colors.green.shade50
                         : colorScheme.surfaceContainerHighest,
-                    borderRadius: BorderRadius.circular(6),
+                    borderRadius: BorderRadius.circular(20),
                     border: Border.all(
                       color: isRemoteControlConnected
-                          ? Colors.green.shade300
+                          ? Colors.green.shade400
                           : colorScheme.outlineVariant,
                     ),
                   ),
@@ -904,12 +628,12 @@ class _EndpointCard extends StatelessWidget {
                         isRemoteControlConnected
                             ? Icons.wifi_tethering
                             : Icons.wifi_tethering_off,
-                        size: 13,
+                        size: 14,
                         color: isRemoteControlConnected
                             ? Colors.green.shade800
                             : colorScheme.onSurfaceVariant,
                       ),
-                      const SizedBox(width: 4),
+                      const SizedBox(width: 5),
                       Text(
                         isRemoteControlConnected
                             ? 'Web Sync Ready'
@@ -1018,316 +742,6 @@ class _EndpointCard extends StatelessWidget {
             ),
           ],
         ),
-      ),
-    );
-  }
-}
-
-class _HttpServerCard extends StatelessWidget {
-  const _HttpServerCard({
-    required this.portController,
-    required this.isServing,
-    required this.url,
-    required this.detectedIps,
-    required this.selectedIp,
-    required this.onSelectIp,
-    required this.samplesServed,
-    required this.activeClients,
-    required this.lastRequestAt,
-    required this.onToggleServing,
-  });
-
-  final TextEditingController portController;
-  final bool isServing;
-  final String? url;
-  final List<DetectedIp> detectedIps;
-  final String? selectedIp;
-  final ValueChanged<String> onSelectIp;
-  final int samplesServed;
-  final int activeClients;
-  final DateTime? lastRequestAt;
-  final VoidCallback onToggleServing;
-
-  @override
-  Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    final colorScheme = theme.colorScheme;
-    final displayUrl = url ?? 'http://0.0.0.0:${portController.text.trim()}';
-    final isCellular = selectedIp != null &&
-        (detectedIps.any((d) => d.ip == selectedIp && (d.isCgnat || !d.isWifi)));
-
-    return Card(
-      elevation: 0,
-      color: Colors.white,
-      child: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            Row(
-              children: [
-                Icon(Icons.http, color: colorScheme.primary),
-                const SizedBox(width: 10),
-                Expanded(
-                  child: Text(
-                    'Local HTTP Access',
-                    style: theme.textTheme.titleMedium?.copyWith(
-                      fontWeight: FontWeight.w700,
-                    ),
-                  ),
-                ),
-                _StatusPill(isStreaming: isServing),
-              ],
-            ),
-            const SizedBox(height: 14),
-            LayoutBuilder(
-              builder: (context, constraints) {
-                final portField = TextField(
-                  controller: portController,
-                  decoration: const InputDecoration(
-                    labelText: 'HTTP Port',
-                    prefixIcon: Icon(Icons.settings_ethernet),
-                    border: OutlineInputBorder(),
-                  ),
-                  keyboardType: TextInputType.number,
-                  enabled: !isServing,
-                );
-
-                final button = FilledButton.icon(
-                  onPressed: onToggleServing,
-                  icon: Icon(isServing ? Icons.stop : Icons.play_arrow),
-                  label: Text(isServing ? 'Stop HTTP' : 'Start HTTP'),
-                  style: FilledButton.styleFrom(
-                    minimumSize: const Size(148, 56),
-                    shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(8),
-                    ),
-                  ),
-                );
-
-                if (constraints.maxWidth >= 620) {
-                  return Row(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      SizedBox(width: 220, child: portField),
-                      const SizedBox(width: 12),
-                      Expanded(child: _EndpointUrl(url: displayUrl, isServing: isServing)),
-                      const SizedBox(width: 12),
-                      button,
-                    ],
-                  );
-                }
-
-                return Column(
-                  crossAxisAlignment: CrossAxisAlignment.stretch,
-                  children: [
-                    portField,
-                    const SizedBox(height: 12),
-                    _EndpointUrl(url: displayUrl, isServing: isServing),
-                    const SizedBox(height: 12),
-                    button,
-                  ],
-                );
-              },
-            ),
-            if (isServing && detectedIps.length > 1) ...[
-              const SizedBox(height: 12),
-              Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    'Detected IP Addresses:',
-                    style: theme.textTheme.labelMedium?.copyWith(
-                      color: colorScheme.onSurfaceVariant,
-                      fontWeight: FontWeight.w700,
-                    ),
-                  ),
-                  const SizedBox(height: 6),
-                  Wrap(
-                    spacing: 8,
-                    runSpacing: 6,
-                    children: [
-                      for (final d in detectedIps)
-                        ChoiceChip(
-                          avatar: Icon(
-                            d.isWifi ? Icons.wifi : Icons.cell_tower,
-                            size: 16,
-                          ),
-                          label: Text('${d.label}: ${d.ip}'),
-                          selected: selectedIp == d.ip,
-                          onSelected: (selected) {
-                            if (selected) onSelectIp(d.ip);
-                          },
-                        ),
-                    ],
-                  ),
-                ],
-              ),
-            ],
-            if (isServing && isCellular) ...[
-              const SizedBox(height: 12),
-              Container(
-                padding: const EdgeInsets.all(12),
-                decoration: BoxDecoration(
-                  color: Colors.amber.shade50,
-                  borderRadius: BorderRadius.circular(8),
-                  border: Border.all(color: Colors.amber.shade400),
-                ),
-                child: Row(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Icon(Icons.info_outline, size: 20, color: Colors.amber.shade900),
-                    const SizedBox(width: 10),
-                    Expanded(
-                      child: Text(
-                        'Using cellular IP ($selectedIp). To connect with your computer dashboard, ensure your iPhone is connected to Wi-Fi on the same local network as your PC (e.g. 192.168.1.69).',
-                        style: theme.textTheme.bodySmall?.copyWith(
-                          color: Colors.amber.shade900,
-                          fontWeight: FontWeight.w600,
-                        ),
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-            ],
-            if (isServing && url != null) ...[
-              const SizedBox(height: 16),
-              Container(
-                padding: const EdgeInsets.all(16),
-                decoration: BoxDecoration(
-                  color: colorScheme.surfaceContainerHighest.withValues(alpha: 0.45),
-                  borderRadius: BorderRadius.circular(12),
-                  border: Border.all(color: colorScheme.outlineVariant),
-                ),
-                child: Column(
-                  children: [
-                    Row(
-                      mainAxisAlignment: MainAxisAlignment.center,
-                      children: [
-                        Icon(Icons.qr_code_2, size: 20, color: colorScheme.primary),
-                        const SizedBox(width: 8),
-                        Text(
-                          'Scan to Connect Web Dashboard',
-                          style: theme.textTheme.titleSmall?.copyWith(
-                            fontWeight: FontWeight.w700,
-                          ),
-                        ),
-                      ],
-                    ),
-                    const SizedBox(height: 12),
-                    Container(
-                      padding: const EdgeInsets.all(12),
-                      decoration: BoxDecoration(
-                        color: Colors.white,
-                        borderRadius: BorderRadius.circular(12),
-                        boxShadow: [
-                          BoxShadow(
-                            color: Colors.black.withValues(alpha: 0.06),
-                            blurRadius: 8,
-                            offset: const Offset(0, 2),
-                          ),
-                        ],
-                      ),
-                      child: QrImageView(
-                        data: url!,
-                        version: QrVersions.auto,
-                        size: 160,
-                        backgroundColor: Colors.white,
-                        errorCorrectionLevel: QrErrorCorrectLevel.M,
-                      ),
-                    ),
-                    const SizedBox(height: 8),
-                    Text(
-                      url!,
-                      style: theme.textTheme.bodySmall?.copyWith(
-                        color: colorScheme.onSurfaceVariant,
-                        fontFeatures: const [FontFeature.tabularFigures()],
-                        fontWeight: FontWeight.w600,
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-            ],
-            const SizedBox(height: 14),
-            Wrap(
-              spacing: 10,
-              runSpacing: 10,
-              children: [
-                _MetricChip(
-                  icon: Icons.article,
-                  label: 'Served',
-                  value: samplesServed.toString(),
-                ),
-                _MetricChip(
-                  icon: Icons.hub,
-                  label: 'Clients',
-                  value: activeClients.toString(),
-                ),
-                _MetricChip(
-                  icon: Icons.schedule,
-                  label: 'Last',
-                  value: lastRequestAt == null
-                      ? '--'
-                      : _formatClock(lastRequestAt!),
-                ),
-              ],
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-}
-
-class _EndpointUrl extends StatelessWidget {
-  const _EndpointUrl({required this.url, required this.isServing});
-
-  final String url;
-  final bool isServing;
-
-  @override
-  Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    final colorScheme = theme.colorScheme;
-
-    return Container(
-      constraints: const BoxConstraints(minHeight: 56),
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-      decoration: BoxDecoration(
-        color: colorScheme.surfaceContainerHighest,
-        borderRadius: BorderRadius.circular(8),
-        border: Border.all(color: colorScheme.outlineVariant),
-      ),
-      child: Row(
-        children: [
-          Expanded(
-            child: SelectableText(
-              '$url/sample\n$url/stream',
-              style: theme.textTheme.bodyMedium?.copyWith(
-                fontFeatures: const [FontFeature.tabularFigures()],
-                height: 1.25,
-              ),
-            ),
-          ),
-          if (isServing) ...[
-            const SizedBox(width: 8),
-            IconButton(
-              tooltip: 'Copy URL',
-              icon: const Icon(Icons.copy, size: 20),
-              onPressed: () {
-                Clipboard.setData(ClipboardData(text: url));
-                ScaffoldMessenger.of(context).showSnackBar(
-                  SnackBar(
-                    content: Text('Copied $url to clipboard'),
-                    duration: const Duration(seconds: 2),
-                  ),
-                );
-              },
-            ),
-          ],
-        ],
       ),
     );
   }
@@ -1637,4 +1051,246 @@ String _formatClock(DateTime time) {
   final minute = time.minute.toString().padLeft(2, '0');
   final second = time.second.toString().padLeft(2, '0');
   return '$hour:$minute:$second';
+}
+
+class _InstructionsDialog extends StatelessWidget {
+  const _InstructionsDialog();
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final colorScheme = theme.colorScheme;
+
+    return Dialog(
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+      backgroundColor: Colors.white,
+      insetPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 24),
+      child: ConstrainedBox(
+        constraints: const BoxConstraints(maxWidth: 640, maxHeight: 720),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            // Header
+            Padding(
+              padding: const EdgeInsets.fromLTRB(20, 18, 12, 12),
+              child: Row(
+                children: [
+                  Container(
+                    padding: const EdgeInsets.all(8),
+                    decoration: BoxDecoration(
+                      color: colorScheme.primary.withValues(alpha: 0.1),
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                    child: Icon(
+                      Icons.menu_book_rounded,
+                      color: colorScheme.primary,
+                      size: 22,
+                    ),
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          'How to Use This App',
+                          style: theme.textTheme.titleMedium?.copyWith(
+                            fontWeight: FontWeight.w800,
+                          ),
+                        ),
+                        Text(
+                          'Mobile IMU Streamer & Sensor Guide',
+                          style: theme.textTheme.bodySmall?.copyWith(
+                            color: colorScheme.onSurfaceVariant,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  IconButton(
+                    icon: const Icon(Icons.close, size: 20),
+                    onPressed: () => Navigator.of(context).pop(),
+                  ),
+                ],
+              ),
+            ),
+            const Divider(height: 1),
+            // Content
+            Flexible(
+              child: SingleChildScrollView(
+                padding: const EdgeInsets.all(20),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    _InstructionSection(
+                      title: '1. Streaming to Computer (UDP Mode)',
+                      icon: Icons.wifi,
+                      color: colorScheme.primary,
+                      description:
+                          'Streams high-speed 3-axis Accelerometer and Gyroscope data (~100 Hz) directly to your PC for LSL recording, Python scripts, or the Web Dashboard.',
+                      steps: const [
+                        'Ensure your phone and computer are on the same Wi-Fi network.',
+                        'Run "python server.py" on your computer to launch the server hub and web dashboard.',
+                        'Enter your computer\'s IP Address (e.g. 192.168.1.69) and UDP Port (12345) in the fields above.',
+                        'Tap "Start" to begin transmitting data datagrams.',
+                        'Open http://localhost:3000 on your PC browser to view real-time charts and 3D orientation.',
+                      ],
+                    ),
+                    const SizedBox(height: 16),
+                    _InstructionSection(
+                      title: '2. Web Sync & Remote Control',
+                      icon: Icons.sync,
+                      color: Colors.indigo.shade700,
+                      description:
+                          'When your PC server hub is running, the phone automatically synchronizes via SSE (Server-Sent Events).',
+                      steps: const [
+                        'When connected, the green "Web Sync Ready" badge appears at the top.',
+                        'You can start and stop streaming directly from the PC Web Dashboard without touching your phone.',
+                      ],
+                    ),
+                    const SizedBox(height: 16),
+                    _InstructionSection(
+                      title: '3. Sensor Units & Coordinate Frame',
+                      icon: Icons.speed,
+                      color: Colors.deepPurple.shade700,
+                      description:
+                          'Live IMU metrics streamed at ~100 Hz:',
+                      steps: const [
+                        'Accelerometer (m/s²): Measures acceleration including gravity (~9.81 m/s² on Z when flat on a table).',
+                        'Gyroscope (rad/s): Measures angular rate of rotation around X, Y, and Z axes.',
+                        'Sparklines at the bottom display real-time sensor waveform history.',
+                      ],
+                    ),
+                    const SizedBox(height: 16),
+                    _InstructionSection(
+                      title: '4. Troubleshooting Tips',
+                      icon: Icons.help_outline,
+                      color: Colors.amber.shade900,
+                      steps: const [
+                        'If streaming fails to connect, verify both devices are on the same Wi-Fi subnet and VPNs are disabled.',
+                        'If using cellular data, switch to a shared Wi-Fi network or phone hotspot.',
+                        'Ensure your PC firewall permits incoming UDP traffic on port 12345 and TCP traffic on port 3000.',
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+            ),
+            const Divider(height: 1),
+            // Footer
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.end,
+                children: [
+                  FilledButton(
+                    onPressed: () => Navigator.of(context).pop(),
+                    child: const Text('Got it'),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _InstructionSection extends StatelessWidget {
+  const _InstructionSection({
+    required this.title,
+    required this.icon,
+    required this.color,
+    required this.steps,
+    this.description,
+  });
+
+  final String title;
+  final IconData icon;
+  final Color color;
+  final List<String> steps;
+  final String? description;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final colorScheme = theme.colorScheme;
+
+    return Container(
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: colorScheme.surfaceContainerHighest.withValues(alpha: 0.35),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: colorScheme.outlineVariant),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Icon(icon, color: color, size: 20),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  title,
+                  style: theme.textTheme.titleSmall?.copyWith(
+                    fontWeight: FontWeight.w700,
+                    color: color,
+                  ),
+                ),
+              ),
+            ],
+          ),
+          if (description != null) ...[
+            const SizedBox(height: 6),
+            Text(
+              description!,
+              style: theme.textTheme.bodySmall?.copyWith(
+                color: theme.textTheme.bodySmall?.color?.withValues(alpha: 0.85),
+                height: 1.35,
+              ),
+            ),
+          ],
+          const SizedBox(height: 8),
+          for (var i = 0; i < steps.length; i++)
+            Padding(
+              padding: const EdgeInsets.only(bottom: 6),
+              child: Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Container(
+                    width: 18,
+                    height: 18,
+                    margin: const EdgeInsets.only(top: 2, right: 8),
+                    decoration: BoxDecoration(
+                      color: color.withValues(alpha: 0.12),
+                      shape: BoxShape.circle,
+                    ),
+                    alignment: Alignment.center,
+                    child: Text(
+                      '${i + 1}',
+                      style: TextStyle(
+                        fontSize: 10,
+                        fontWeight: FontWeight.w800,
+                        color: color,
+                      ),
+                    ),
+                  ),
+                  Expanded(
+                    child: Text(
+                      steps[i],
+                      style: theme.textTheme.bodySmall?.copyWith(
+                        height: 1.35,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+        ],
+      ),
+    );
+  }
 }
