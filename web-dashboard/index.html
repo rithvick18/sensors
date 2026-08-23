@@ -3,27 +3,26 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Sensor Dashboard — Live Phone Sensor Data</title>
-  <meta name="description" content="Real-time web dashboard for viewing accelerometer and gyroscope sensor data streamed from your phone." />
+  <title>Sensor LSL Streamer — Live Dashboard</title>
+  <meta name="description" content="Real-time motion sensor dashboard matching the Flutter mobile app." />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;600;700&display=swap" rel="stylesheet" />
   <link rel="stylesheet" href="style.css" />
 </head>
 <body>
   <div class="app">
-    <!-- Header -->
+    <!-- App Bar / Header -->
     <header class="header" id="app-header">
       <div class="header-left">
         <div class="logo-icon">
-          <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M2 12s3-7 10-7 10 7 10 7-3 7-10 7S2 12 2 12z"/>
-            <circle cx="12" cy="12" r="3"/>
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/>
           </svg>
         </div>
         <div>
-          <h1 class="header-title">Sensor Dashboard</h1>
-          <p class="header-subtitle">Live phone sensor data</p>
+          <h1 class="header-title">Sensor LSL Streamer</h1>
+          <p class="header-subtitle">Real-time phone motion sensors & MNE-LSL hub</p>
         </div>
       </div>
       <div class="header-right">
@@ -34,81 +33,90 @@
       </div>
     </header>
 
-    <!-- Connection Panel -->
+    <!-- Stream Summary Card (Matching Flutter _StreamSummary) -->
     <section class="connect-panel glass-card" id="connect-panel">
       <div class="connect-inner">
         <div class="connect-icon-wrap">
-          <svg class="connect-icon" width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-            <rect x="5" y="2" width="14" height="20" rx="2" ry="2"/>
-            <line x1="12" y1="18" x2="12.01" y2="18"/>
+          <svg class="connect-icon" width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="2" y="2" width="20" height="8" rx="2" ry="2"/>
+            <rect x="2" y="14" width="20" height="8" rx="2" ry="2"/>
+            <line x1="6" y1="6" x2="6.01" y2="6"/>
+            <line x1="6" y1="18" x2="6.01" y2="18"/>
           </svg>
         </div>
         <div class="connect-fields">
-          <label class="field-label" for="phone-url">Phone HTTP URL</label>
+          <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px;">
+            <label class="field-label" style="margin-bottom: 0;" for="phone-url">Sensor Stream Hub Endpoint</label>
+            <span class="phone-sync-pill" id="phone-sync-pill">
+              <span class="sync-dot" id="sync-dot"></span>
+              <span id="sync-text">Phone: Checking...</span>
+            </span>
+          </div>
           <div class="url-input-group">
             <input
               type="text"
               id="phone-url"
               class="url-input"
-              placeholder="http://192.168.1.100:8080"
+              placeholder="http://localhost:3000"
               spellcheck="false"
               autocomplete="off"
             />
-            <button class="btn btn-primary" id="connect-btn">
-              <span class="btn-icon">
-                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
-                  <path d="M5 12h14M12 5l7 7-7 7"/>
+            <button class="btn btn-primary" id="remote-stream-btn" type="button">
+              <span class="btn-icon" id="remote-btn-icon">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                  <polygon points="5 3 19 12 5 21 5 3"/>
                 </svg>
               </span>
-              <span class="btn-label" id="connect-btn-label">Connect</span>
+              <span class="btn-label" id="remote-btn-label">Start Streaming</span>
             </button>
           </div>
-          <p class="connect-hint">Start the HTTP server on your phone, then enter its URL here.</p>
+          <p class="connect-hint">⚡ <b>2-Way Control Active:</b> Click above to start/stop remotely, or tap Start/Stop directly on your iPhone!</p>
         </div>
       </div>
     </section>
 
-    <!-- Stats Bar -->
+    <!-- Stats Bar (Matching Flutter _MetricChips) -->
     <section class="stats-bar" id="stats-bar">
       <div class="stat-chip" id="stat-samples">
         <span class="stat-icon">
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
         </span>
-        <span class="stat-label">Samples</span>
+        <span class="stat-label">Samples:</span>
         <span class="stat-value" id="stat-samples-value">0</span>
       </div>
       <div class="stat-chip" id="stat-rate">
         <span class="stat-icon">
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
         </span>
-        <span class="stat-label">Rate</span>
+        <span class="stat-label">Rate:</span>
         <span class="stat-value" id="stat-rate-value">0 Hz</span>
       </div>
       <div class="stat-chip" id="stat-latency">
         <span class="stat-icon">
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>
         </span>
-        <span class="stat-label">Elapsed</span>
+        <span class="stat-label">Time:</span>
         <span class="stat-value" id="stat-latency-value">00:00</span>
       </div>
       <div class="stat-chip" id="stat-packet">
         <span class="stat-icon">
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 20V10M18 20V4M6 20v-4"/></svg>
         </span>
-        <span class="stat-label">Seq</span>
+        <span class="stat-label">Seq:</span>
         <span class="stat-value" id="stat-packet-value">—</span>
       </div>
     </section>
 
-    <!-- Main Dashboard -->
+    <!-- Main Dashboard Sensor Cards (Matching Flutter _SensorCard) -->
     <main class="dashboard" id="dashboard">
       <!-- Accelerometer Card -->
       <section class="sensor-card glass-card" id="accel-card">
         <div class="sensor-header">
           <div class="sensor-title-group">
             <div class="sensor-icon accel-icon">
-              <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                <path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/>
+              <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="12" cy="12" r="10"/>
+                <polyline points="12 6 12 12 16 14"/>
               </svg>
             </div>
             <div>
@@ -125,21 +133,21 @@
             <div class="axis-bar-track">
               <div class="axis-bar accel-bar" id="accel-x-bar"></div>
             </div>
-            <span class="axis-value mono" id="accel-x-value">0.000</span>
+            <span class="axis-value mono" id="accel-x-value">0.000 m/s²</span>
           </div>
           <div class="axis-row">
             <span class="axis-label accel-label">Y</span>
             <div class="axis-bar-track">
               <div class="axis-bar accel-bar" id="accel-y-bar"></div>
             </div>
-            <span class="axis-value mono" id="accel-y-value">0.000</span>
+            <span class="axis-value mono" id="accel-y-value">0.000 m/s²</span>
           </div>
           <div class="axis-row">
             <span class="axis-label accel-label">Z</span>
             <div class="axis-bar-track">
               <div class="axis-bar accel-bar" id="accel-z-bar"></div>
             </div>
-            <span class="axis-value mono" id="accel-z-value">0.000</span>
+            <span class="axis-value mono" id="accel-z-value">0.000 m/s²</span>
           </div>
         </div>
 
@@ -153,9 +161,8 @@
         <div class="sensor-header">
           <div class="sensor-title-group">
             <div class="sensor-icon gyro-icon">
-              <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                <path d="M21 12a9 9 0 11-6.219-8.56"/>
-                <polyline points="21 3 21 9 15 9"/>
+              <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/>
               </svg>
             </div>
             <div>
@@ -172,21 +179,21 @@
             <div class="axis-bar-track">
               <div class="axis-bar gyro-bar" id="gyro-x-bar"></div>
             </div>
-            <span class="axis-value mono" id="gyro-x-value">0.000</span>
+            <span class="axis-value mono" id="gyro-x-value">0.000 rad/s</span>
           </div>
           <div class="axis-row">
             <span class="axis-label gyro-label">Y</span>
             <div class="axis-bar-track">
               <div class="axis-bar gyro-bar" id="gyro-y-bar"></div>
             </div>
-            <span class="axis-value mono" id="gyro-y-value">0.000</span>
+            <span class="axis-value mono" id="gyro-y-value">0.000 rad/s</span>
           </div>
           <div class="axis-row">
             <span class="axis-label gyro-label">Z</span>
             <div class="axis-bar-track">
               <div class="axis-bar gyro-bar" id="gyro-z-bar"></div>
             </div>
-            <span class="axis-value mono" id="gyro-z-value">0.000</span>
+            <span class="axis-value mono" id="gyro-z-value">0.000 rad/s</span>
           </div>
         </div>
 
@@ -196,27 +203,19 @@
       </section>
     </main>
 
-    <!-- 3D Orientation Visualization -->
+    <!-- Raw Live Data Feed -->
     <section class="orientation-section glass-card" id="orientation-section">
       <div class="sensor-header">
         <div class="sensor-title-group">
           <div class="sensor-icon orient-icon">
-            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <rect x="4" y="4" width="16" height="16" rx="2" ry="2"/>
-              <rect x="9" y="9" width="6" height="6"/>
-              <line x1="9" y1="1" x2="9" y2="4"/>
-              <line x1="15" y1="1" x2="15" y2="4"/>
-              <line x1="9" y1="20" x2="9" y2="23"/>
-              <line x1="15" y1="20" x2="15" y2="23"/>
-              <line x1="20" y1="9" x2="23" y2="9"/>
-              <line x1="20" y1="14" x2="23" y2="14"/>
-              <line x1="1" y1="9" x2="4" y2="9"/>
-              <line x1="1" y1="14" x2="4" y2="14"/>
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <polyline points="4 17 10 11 4 5"/>
+              <line x1="12" y1="19" x2="20" y2="19"/>
             </svg>
           </div>
           <div>
-            <h2 class="sensor-name">Live Data Feed</h2>
-            <span class="sensor-unit">Raw JSON packets</span>
+            <h2 class="sensor-name">Live JSON Stream Feed</h2>
+            <span class="sensor-unit">Raw parsed packet inspect</span>
           </div>
         </div>
       </div>
@@ -224,7 +223,6 @@
         <pre class="data-feed mono" id="data-feed"></pre>
       </div>
     </section>
-
   </div>
 
   <script src="app.js"></script>

@@ -4,6 +4,8 @@ import 'dart:io';
 import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:qr_flutter/qr_flutter.dart';
 import 'package:sensors_plus/sensors_plus.dart';
 
 void main() {
@@ -35,6 +37,22 @@ class SensorStreamerPage extends StatefulWidget {
   State<SensorStreamerPage> createState() => _SensorStreamerPageState();
 }
 
+class DetectedIp {
+  final String ip;
+  final String interfaceName;
+  final String label;
+  final bool isWifi;
+  final bool isCgnat;
+
+  const DetectedIp({
+    required this.ip,
+    required this.interfaceName,
+    required this.label,
+    required this.isWifi,
+    required this.isCgnat,
+  });
+}
+
 class _SensorStreamerPageState extends State<SensorStreamerPage> {
   static const _sensorSamplingPeriod = Duration(milliseconds: 10);
   static const _udpSamplingPeriod = Duration(milliseconds: 10);
@@ -43,7 +61,7 @@ class _SensorStreamerPageState extends State<SensorStreamerPage> {
   static const _historyLength = 80;
 
   final TextEditingController _ipController = TextEditingController(
-    text: '192.168.1.100',
+    text: '192.168.1.69',
   );
   final TextEditingController _portController = TextEditingController(
     text: '12345',
@@ -80,6 +98,14 @@ class _SensorStreamerPageState extends State<SensorStreamerPage> {
   DateTime? _lastSensorAt;
   String? _sensorError;
   String? _httpUrl;
+  List<DetectedIp> _detectedIps = <DetectedIp>[];
+  String? _selectedIp;
+  bool _isRemoteControlConnected = false;
+
+  HttpClient? _controlClient;
+  StreamSubscription<String>? _controlSub;
+  RawDatagramSocket? _commandSocket;
+  Timer? _controlReconnectTimer;
 
   final List<double> _accelHistory = <double>[];
   final List<double> _gyroHistory = <double>[];
@@ -88,6 +114,9 @@ class _SensorStreamerPageState extends State<SensorStreamerPage> {
   void initState() {
     super.initState();
     _startSensorListeners();
+    _startControlListener();
+    _startUdpCommandListener();
+    _ipController.addListener(_onIpChanged);
     _displayTimer = Timer.periodic(_displayRefreshPeriod, (_) {
       if (!mounted) return;
       setState(() {
@@ -104,8 +133,17 @@ class _SensorStreamerPageState extends State<SensorStreamerPage> {
     });
   }
 
+  void _onIpChanged() {
+    _startControlListener();
+  }
+
   @override
   void dispose() {
+    _ipController.removeListener(_onIpChanged);
+    _controlReconnectTimer?.cancel();
+    _controlSub?.cancel();
+    _controlClient?.close(force: true);
+    _commandSocket?.close();
     _stopStreaming(updateUi: false);
     _stopHttpServer(updateUi: false);
     _displayTimer?.cancel();
@@ -158,6 +196,92 @@ class _SensorStreamerPageState extends State<SensorStreamerPage> {
             _setSensorError('Gyroscope unavailable');
           },
         );
+  }
+
+  void _startControlListener() {
+    _controlSub?.cancel();
+    _controlClient?.close(force: true);
+
+    final ip = _ipController.text.trim();
+    if (ip.isEmpty) return;
+
+    final client = HttpClient()..connectionTimeout = const Duration(seconds: 4);
+    _controlClient = client;
+
+    client
+        .getUrl(Uri.parse('http://$ip:3000/api/control/stream'))
+        .then((request) => request.close())
+        .then((response) {
+      if (!mounted) return;
+      setState(() => _isRemoteControlConnected = true);
+
+      _controlSub = response
+          .transform(utf8.decoder)
+          .transform(const LineSplitter())
+          .listen(
+        (line) {
+          final trimmed = line.trim();
+          if (trimmed.isEmpty) return;
+          try {
+            final data = jsonDecode(trimmed) as Map<String, dynamic>;
+            final action = (data['action'] as String?)?.toUpperCase();
+            if (action == 'START') {
+              if (!_isStreaming) {
+                _startStreaming();
+              }
+            } else if (action == 'STOP') {
+              if (_isStreaming) {
+                _stopStreaming();
+              }
+            }
+          } catch (_) {}
+        },
+        onError: (_) {
+          if (mounted) setState(() => _isRemoteControlConnected = false);
+          _scheduleControlReconnect();
+        },
+        onDone: () {
+          if (mounted) setState(() => _isRemoteControlConnected = false);
+          _scheduleControlReconnect();
+        },
+        cancelOnError: true,
+      );
+    }).catchError((_) {
+      if (mounted) setState(() => _isRemoteControlConnected = false);
+      _scheduleControlReconnect();
+    });
+  }
+
+  void _scheduleControlReconnect() {
+    _controlReconnectTimer?.cancel();
+    if (!mounted) return;
+    _controlReconnectTimer = Timer(const Duration(seconds: 3), () {
+      if (mounted) _startControlListener();
+    });
+  }
+
+  Future<void> _startUdpCommandListener() async {
+    try {
+      _commandSocket =
+          await RawDatagramSocket.bind(InternetAddress.anyIPv4, 12346);
+      _commandSocket?.listen((event) {
+        if (event == RawSocketEvent.read) {
+          final datagram = _commandSocket?.receive();
+          if (datagram != null) {
+            final message = utf8.decode(datagram.data).trim();
+            try {
+              final data = jsonDecode(message) as Map<String, dynamic>;
+              final action = (data['action'] as String?)?.toUpperCase();
+              if (action == 'START' && !_isStreaming) {
+                _startStreaming();
+              } else if (action == 'STOP' && _isStreaming) {
+                _stopStreaming();
+              }
+            } catch (_) {}
+          }
+        }
+      });
+    } catch (_) {}
   }
 
   Future<void> _startStreaming() async {
@@ -233,19 +357,32 @@ class _SensorStreamerPageState extends State<SensorStreamerPage> {
         onError: (Object error) => _showError('HTTP server error: $error'),
       );
 
-      final lanIp = await _resolveLanIpv4();
+      final detected = await _resolveAllIpv4();
+      final chosenIp = detected.isNotEmpty ? detected.first.ip : server.address.address;
+
       if (!mounted) return;
       setState(() {
         _isHttpServing = true;
         _httpSamplesServed = 0;
         _httpClients = 0;
         _lastHttpRequestAt = null;
-        _httpUrl = 'http://${lanIp ?? server.address.address}:$port';
+        _detectedIps = detected;
+        _selectedIp = chosenIp;
+        _httpUrl = 'http://$chosenIp:$port';
       });
     } catch (error) {
       _showError('Failed to start HTTP server: $error');
       await _stopHttpServer();
     }
+  }
+
+  void _selectIp(String ip) {
+    if (!mounted) return;
+    final port = _httpPortController.text.trim();
+    setState(() {
+      _selectedIp = ip;
+      _httpUrl = 'http://$ip:$port';
+    });
   }
 
   Future<void> _stopHttpServer({bool updateUi = true}) async {
@@ -258,6 +395,8 @@ class _SensorStreamerPageState extends State<SensorStreamerPage> {
       _isHttpServing = false;
       _httpClients = 0;
       _httpUrl = null;
+      _detectedIps = <DetectedIp>[];
+      _selectedIp = null;
     }
 
     if (updateUi && mounted) {
@@ -379,21 +518,83 @@ class _SensorStreamerPageState extends State<SensorStreamerPage> {
       ..set(HttpHeaders.cacheControlHeader, 'no-store');
   }
 
-  Future<String?> _resolveLanIpv4() async {
+  Future<List<DetectedIp>> _resolveAllIpv4() async {
+    final list = <DetectedIp>[];
     try {
       final interfaces = await NetworkInterface.list(
         includeLinkLocal: false,
         type: InternetAddressType.IPv4,
       );
-      for (final interface in interfaces) {
-        for (final address in interface.addresses) {
-          if (!address.isLoopback) return address.address;
+      for (final iface in interfaces) {
+        final name = iface.name.toLowerCase();
+        for (final address in iface.addresses) {
+          if (address.isLoopback) continue;
+          final ip = address.address;
+          final isWifi = name.startsWith('en0') ||
+              name.startsWith('wlan') ||
+              name.contains('wifi') ||
+              name == 'en';
+          final isCgnat = _isCarrierCgnat(ip);
+          String label;
+          if (isWifi) {
+            label = 'Wi-Fi ($name)';
+          } else if (name.startsWith('pdp_ip')) {
+            label = 'Cellular ($name)';
+          } else if (name.startsWith('utun') || name.contains('tun')) {
+            label = 'VPN ($name)';
+          } else {
+            label = iface.name;
+          }
+          list.add(
+            DetectedIp(
+              ip: ip,
+              interfaceName: iface.name,
+              label: label,
+              isWifi: isWifi,
+              isCgnat: isCgnat,
+            ),
+          );
         }
       }
-    } catch (_) {
-      return null;
+    } catch (_) {}
+
+    list.sort((a, b) {
+      int score(DetectedIp item) {
+        final isPriv = _isPrivateLan(item.ip);
+        if (item.isWifi && isPriv && !item.isCgnat) return 100;
+        if (item.isWifi && !item.isCgnat) return 80;
+        if (isPriv && !item.isCgnat) return 60;
+        if (item.label.contains('VPN')) return 40;
+        if (item.isCgnat || item.label.contains('Cellular')) return 10;
+        return 20;
+      }
+
+      return score(b).compareTo(score(a));
+    });
+
+    return list;
+  }
+
+  bool _isCarrierCgnat(String ip) {
+    final parts = ip.split('.').map(int.tryParse).toList();
+    if (parts.length == 4 &&
+        parts[0] == 100 &&
+        parts[1] != null &&
+        parts[1]! >= 64 &&
+        parts[1]! <= 127) {
+      return true;
     }
-    return null;
+    return false;
+  }
+
+  bool _isPrivateLan(String ip) {
+    final parts = ip.split('.').map(int.tryParse).toList();
+    if (parts.length != 4 || parts.any((p) => p == null)) return false;
+    final a = parts[0]!, b = parts[1]!;
+    if (a == 192 && b == 168) return true;
+    if (a == 10 && !_isCarrierCgnat(ip)) return true;
+    if (a == 172 && b >= 16 && b <= 31) return true;
+    return false;
   }
 
   void _stopStreaming({bool updateUi = true}) {
@@ -474,6 +675,7 @@ class _SensorStreamerPageState extends State<SensorStreamerPage> {
                     ipController: _ipController,
                     portController: _portController,
                     isStreaming: _isStreaming,
+                    isRemoteControlConnected: _isRemoteControlConnected,
                     onToggleStreaming: _isStreaming
                         ? _stopStreaming
                         : () => _startStreaming(),
@@ -483,6 +685,9 @@ class _SensorStreamerPageState extends State<SensorStreamerPage> {
                     portController: _httpPortController,
                     isServing: _isHttpServing,
                     url: _httpUrl,
+                    detectedIps: _detectedIps,
+                    selectedIp: _selectedIp,
+                    onSelectIp: _selectIp,
                     samplesServed: _httpSamplesServed,
                     activeClients: _httpClients,
                     lastRequestAt: _lastHttpRequestAt,
@@ -644,106 +849,174 @@ class _EndpointCard extends StatelessWidget {
     required this.ipController,
     required this.portController,
     required this.isStreaming,
+    required this.isRemoteControlConnected,
     required this.onToggleStreaming,
   });
 
   final TextEditingController ipController;
   final TextEditingController portController;
   final bool isStreaming;
+  final bool isRemoteControlConnected;
   final VoidCallback onToggleStreaming;
 
   @override
   Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final colorScheme = theme.colorScheme;
+
     return Card(
       elevation: 0,
       color: Colors.white,
       child: Padding(
         padding: const EdgeInsets.all(16),
-        child: LayoutBuilder(
-          builder: (context, constraints) {
-            final fields = [
-              Expanded(
-                flex: 3,
-                child: TextField(
-                  controller: ipController,
-                  decoration: const InputDecoration(
-                    labelText: 'PC IP Address',
-                    prefixIcon: Icon(Icons.computer),
-                    border: OutlineInputBorder(),
-                  ),
-                  keyboardType: TextInputType.text,
-                  enabled: !isStreaming,
-                ),
-              ),
-              Expanded(
-                flex: 2,
-                child: TextField(
-                  controller: portController,
-                  decoration: const InputDecoration(
-                    labelText: 'UDP Port',
-                    prefixIcon: Icon(Icons.settings_ethernet),
-                    border: OutlineInputBorder(),
-                  ),
-                  keyboardType: TextInputType.number,
-                  enabled: !isStreaming,
-                ),
-              ),
-            ];
-
-            final button = FilledButton.icon(
-              onPressed: onToggleStreaming,
-              icon: Icon(isStreaming ? Icons.stop : Icons.play_arrow),
-              label: Text(isStreaming ? 'Stop' : 'Start'),
-              style: FilledButton.styleFrom(
-                minimumSize: const Size(132, 56),
-                shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(8),
-                ),
-              ),
-            );
-
-            if (constraints.maxWidth >= 680) {
-              return Row(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  fields[0],
-                  const SizedBox(width: 12),
-                  fields[1],
-                  const SizedBox(width: 12),
-                  button,
-                ],
-              );
-            }
-
-            return Column(
-              crossAxisAlignment: CrossAxisAlignment.stretch,
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Row(
               children: [
-                TextField(
-                  controller: ipController,
-                  decoration: const InputDecoration(
-                    labelText: 'PC IP Address',
-                    prefixIcon: Icon(Icons.computer),
-                    border: OutlineInputBorder(),
+                Icon(Icons.hub, color: colorScheme.primary),
+                const SizedBox(width: 8),
+                Text(
+                  'UDP Endpoint / Streaming',
+                  style: theme.textTheme.titleMedium?.copyWith(
+                    fontWeight: FontWeight.w700,
                   ),
-                  keyboardType: TextInputType.text,
-                  enabled: !isStreaming,
                 ),
-                const SizedBox(height: 12),
-                TextField(
-                  controller: portController,
-                  decoration: const InputDecoration(
-                    labelText: 'UDP Port',
-                    prefixIcon: Icon(Icons.settings_ethernet),
-                    border: OutlineInputBorder(),
+                const Spacer(),
+                Container(
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                  decoration: BoxDecoration(
+                    color: isRemoteControlConnected
+                        ? Colors.green.shade50
+                        : colorScheme.surfaceContainerHighest,
+                    borderRadius: BorderRadius.circular(6),
+                    border: Border.all(
+                      color: isRemoteControlConnected
+                          ? Colors.green.shade300
+                          : colorScheme.outlineVariant,
+                    ),
                   ),
-                  keyboardType: TextInputType.number,
-                  enabled: !isStreaming,
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(
+                        isRemoteControlConnected
+                            ? Icons.wifi_tethering
+                            : Icons.wifi_tethering_off,
+                        size: 13,
+                        color: isRemoteControlConnected
+                            ? Colors.green.shade800
+                            : colorScheme.onSurfaceVariant,
+                      ),
+                      const SizedBox(width: 4),
+                      Text(
+                        isRemoteControlConnected
+                            ? 'Web Sync Ready'
+                            : 'Web Sync Idle',
+                        style: TextStyle(
+                          fontSize: 11,
+                          fontWeight: FontWeight.w700,
+                          color: isRemoteControlConnected
+                              ? Colors.green.shade800
+                              : colorScheme.onSurfaceVariant,
+                        ),
+                      ),
+                    ],
+                  ),
                 ),
-                const SizedBox(height: 12),
-                button,
               ],
-            );
-          },
+            ),
+            const SizedBox(height: 14),
+            LayoutBuilder(
+              builder: (context, constraints) {
+                final fields = [
+                  Expanded(
+                    flex: 3,
+                    child: TextField(
+                      controller: ipController,
+                      decoration: const InputDecoration(
+                        labelText: 'PC IP Address',
+                        prefixIcon: Icon(Icons.computer),
+                        border: OutlineInputBorder(),
+                      ),
+                      keyboardType: TextInputType.text,
+                      enabled: !isStreaming,
+                    ),
+                  ),
+                  Expanded(
+                    flex: 2,
+                    child: TextField(
+                      controller: portController,
+                      decoration: const InputDecoration(
+                        labelText: 'UDP Port',
+                        prefixIcon: Icon(Icons.settings_ethernet),
+                        border: OutlineInputBorder(),
+                      ),
+                      keyboardType: TextInputType.number,
+                      enabled: !isStreaming,
+                    ),
+                  ),
+                ];
+
+                final button = FilledButton.icon(
+                  onPressed: onToggleStreaming,
+                  icon: Icon(isStreaming ? Icons.stop : Icons.play_arrow),
+                  label: Text(isStreaming ? 'Stop' : 'Start'),
+                  style: FilledButton.styleFrom(
+                    minimumSize: const Size(132, 56),
+                    backgroundColor:
+                        isStreaming ? Colors.red.shade700 : null,
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                  ),
+                );
+
+                if (constraints.maxWidth >= 680) {
+                  return Row(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      fields[0],
+                      const SizedBox(width: 12),
+                      fields[1],
+                      const SizedBox(width: 12),
+                      button,
+                    ],
+                  );
+                }
+
+                return Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    TextField(
+                      controller: ipController,
+                      decoration: const InputDecoration(
+                        labelText: 'PC IP Address',
+                        prefixIcon: Icon(Icons.computer),
+                        border: OutlineInputBorder(),
+                      ),
+                      keyboardType: TextInputType.text,
+                      enabled: !isStreaming,
+                    ),
+                    const SizedBox(height: 12),
+                    TextField(
+                      controller: portController,
+                      decoration: const InputDecoration(
+                        labelText: 'UDP Port',
+                        prefixIcon: Icon(Icons.settings_ethernet),
+                        border: OutlineInputBorder(),
+                      ),
+                      keyboardType: TextInputType.number,
+                      enabled: !isStreaming,
+                    ),
+                    const SizedBox(height: 12),
+                    button,
+                  ],
+                );
+              },
+            ),
+          ],
         ),
       ),
     );
@@ -755,6 +1028,9 @@ class _HttpServerCard extends StatelessWidget {
     required this.portController,
     required this.isServing,
     required this.url,
+    required this.detectedIps,
+    required this.selectedIp,
+    required this.onSelectIp,
     required this.samplesServed,
     required this.activeClients,
     required this.lastRequestAt,
@@ -764,6 +1040,9 @@ class _HttpServerCard extends StatelessWidget {
   final TextEditingController portController;
   final bool isServing;
   final String? url;
+  final List<DetectedIp> detectedIps;
+  final String? selectedIp;
+  final ValueChanged<String> onSelectIp;
   final int samplesServed;
   final int activeClients;
   final DateTime? lastRequestAt;
@@ -774,6 +1053,8 @@ class _HttpServerCard extends StatelessWidget {
     final theme = Theme.of(context);
     final colorScheme = theme.colorScheme;
     final displayUrl = url ?? 'http://0.0.0.0:${portController.text.trim()}';
+    final isCellular = selectedIp != null &&
+        (detectedIps.any((d) => d.ip == selectedIp && (d.isCgnat || !d.isWifi)));
 
     return Card(
       elevation: 0,
@@ -830,7 +1111,7 @@ class _HttpServerCard extends StatelessWidget {
                     children: [
                       SizedBox(width: 220, child: portField),
                       const SizedBox(width: 12),
-                      Expanded(child: _EndpointUrl(url: displayUrl)),
+                      Expanded(child: _EndpointUrl(url: displayUrl, isServing: isServing)),
                       const SizedBox(width: 12),
                       button,
                     ],
@@ -842,13 +1123,133 @@ class _HttpServerCard extends StatelessWidget {
                   children: [
                     portField,
                     const SizedBox(height: 12),
-                    _EndpointUrl(url: displayUrl),
+                    _EndpointUrl(url: displayUrl, isServing: isServing),
                     const SizedBox(height: 12),
                     button,
                   ],
                 );
               },
             ),
+            if (isServing && detectedIps.length > 1) ...[
+              const SizedBox(height: 12),
+              Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    'Detected IP Addresses:',
+                    style: theme.textTheme.labelMedium?.copyWith(
+                      color: colorScheme.onSurfaceVariant,
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                  const SizedBox(height: 6),
+                  Wrap(
+                    spacing: 8,
+                    runSpacing: 6,
+                    children: [
+                      for (final d in detectedIps)
+                        ChoiceChip(
+                          avatar: Icon(
+                            d.isWifi ? Icons.wifi : Icons.cell_tower,
+                            size: 16,
+                          ),
+                          label: Text('${d.label}: ${d.ip}'),
+                          selected: selectedIp == d.ip,
+                          onSelected: (selected) {
+                            if (selected) onSelectIp(d.ip);
+                          },
+                        ),
+                    ],
+                  ),
+                ],
+              ),
+            ],
+            if (isServing && isCellular) ...[
+              const SizedBox(height: 12),
+              Container(
+                padding: const EdgeInsets.all(12),
+                decoration: BoxDecoration(
+                  color: Colors.amber.shade50,
+                  borderRadius: BorderRadius.circular(8),
+                  border: Border.all(color: Colors.amber.shade400),
+                ),
+                child: Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Icon(Icons.info_outline, size: 20, color: Colors.amber.shade900),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: Text(
+                        'Using cellular IP ($selectedIp). To connect with your computer dashboard, ensure your iPhone is connected to Wi-Fi on the same local network as your PC (e.g. 192.168.1.69).',
+                        style: theme.textTheme.bodySmall?.copyWith(
+                          color: Colors.amber.shade900,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+            if (isServing && url != null) ...[
+              const SizedBox(height: 16),
+              Container(
+                padding: const EdgeInsets.all(16),
+                decoration: BoxDecoration(
+                  color: colorScheme.surfaceContainerHighest.withValues(alpha: 0.45),
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(color: colorScheme.outlineVariant),
+                ),
+                child: Column(
+                  children: [
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        Icon(Icons.qr_code_2, size: 20, color: colorScheme.primary),
+                        const SizedBox(width: 8),
+                        Text(
+                          'Scan to Connect Web Dashboard',
+                          style: theme.textTheme.titleSmall?.copyWith(
+                            fontWeight: FontWeight.w700,
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 12),
+                    Container(
+                      padding: const EdgeInsets.all(12),
+                      decoration: BoxDecoration(
+                        color: Colors.white,
+                        borderRadius: BorderRadius.circular(12),
+                        boxShadow: [
+                          BoxShadow(
+                            color: Colors.black.withValues(alpha: 0.06),
+                            blurRadius: 8,
+                            offset: const Offset(0, 2),
+                          ),
+                        ],
+                      ),
+                      child: QrImageView(
+                        data: url!,
+                        version: QrVersions.auto,
+                        size: 160,
+                        backgroundColor: Colors.white,
+                        errorCorrectionLevel: QrErrorCorrectLevel.M,
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    Text(
+                      url!,
+                      style: theme.textTheme.bodySmall?.copyWith(
+                        color: colorScheme.onSurfaceVariant,
+                        fontFeatures: const [FontFeature.tabularFigures()],
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
             const SizedBox(height: 14),
             Wrap(
               spacing: 10,
@@ -881,9 +1282,10 @@ class _HttpServerCard extends StatelessWidget {
 }
 
 class _EndpointUrl extends StatelessWidget {
-  const _EndpointUrl({required this.url});
+  const _EndpointUrl({required this.url, required this.isServing});
 
   final String url;
+  final bool isServing;
 
   @override
   Widget build(BuildContext context) {
@@ -898,13 +1300,34 @@ class _EndpointUrl extends StatelessWidget {
         borderRadius: BorderRadius.circular(8),
         border: Border.all(color: colorScheme.outlineVariant),
       ),
-      alignment: Alignment.centerLeft,
-      child: SelectableText(
-        '$url/sample\n$url/stream',
-        style: theme.textTheme.bodyMedium?.copyWith(
-          fontFeatures: const [FontFeature.tabularFigures()],
-          height: 1.25,
-        ),
+      child: Row(
+        children: [
+          Expanded(
+            child: SelectableText(
+              '$url/sample\n$url/stream',
+              style: theme.textTheme.bodyMedium?.copyWith(
+                fontFeatures: const [FontFeature.tabularFigures()],
+                height: 1.25,
+              ),
+            ),
+          ),
+          if (isServing) ...[
+            const SizedBox(width: 8),
+            IconButton(
+              tooltip: 'Copy URL',
+              icon: const Icon(Icons.copy, size: 20),
+              onPressed: () {
+                Clipboard.setData(ClipboardData(text: url));
+                ScaffoldMessenger.of(context).showSnackBar(
+                  SnackBar(
+                    content: Text('Copied $url to clipboard'),
+                    duration: const Duration(seconds: 2),
+                  ),
+                );
+              },
+            ),
+          ],
+        ],
       ),
     );
   }
